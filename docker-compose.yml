@@ -1,0 +1,33 @@
+services:
+  # 后端同步服务
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: bookmark-sync-server
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-this}
+      - DATA_DIR=/app/data
+
+  # 前端导航网站
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        # 构建时需要设置 API URL（外部访问地址）
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://syn.xue.ee}
+    container_name: bookmark-sync-web
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      - server

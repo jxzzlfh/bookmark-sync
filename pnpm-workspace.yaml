@@ -1,0 +1,5 @@
+packages:
+  - 'extension'
+  - 'web'
+  - 'server'
+  - 'packages/*'

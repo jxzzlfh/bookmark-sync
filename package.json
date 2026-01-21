@@ -1,0 +1,26 @@
+{
+  "name": "bookmark-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser bookmark cloud sync with beautiful navigation website",
+  "scripts": {
+    "dev": "pnpm -r --parallel run dev",
+    "dev:extension": "pnpm --filter bookmark-sync-extension run dev",
+    "dev:web": "pnpm --filter bookmark-sync-web run dev",
+    "dev:server": "pnpm --filter bookmark-sync-server run dev",
+    "build": "pnpm -r run build",
+    "build:extension": "pnpm --filter bookmark-sync-extension run build",
+    "build:web": "pnpm --filter bookmark-sync-web run build",
+    "build:server": "pnpm --filter bookmark-sync-server run build",
+    "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test",
+    "clean": "rimraf node_modules extension/node_modules web/node_modules server/node_modules packages/shared/node_modules"
+  },
+  "devDependencies": {
+    "rimraf": "^5.0.5",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
