@@ -45,6 +45,50 @@ router.post('/clear', (req: any, res) => {
   }
 });
 
+// Batch create bookmarks (for optimized sync)
+const batchCreateSchema = z.object({
+  bookmarks: z.array(z.object({
+    localId: z.string().optional(),
+    parentId: z.string().nullable(),
+    title: z.string(),
+    url: z.string().nullable(),
+    isFolder: z.boolean(),
+    sortOrder: z.number().int(),
+    favicon: z.string().nullable().optional(),
+  })),
+});
+
+router.post('/batch', (req: any, res) => {
+  try {
+    const data = batchCreateSchema.parse(req.body);
+    const results: Array<{ id: string; localId?: string }> = [];
+    
+    for (const bookmark of data.bookmarks) {
+      const result = createBookmark(req.userId, {
+        parentId: bookmark.parentId,
+        title: bookmark.title || '(无标题)',
+        url: bookmark.url,
+        isFolder: bookmark.isFolder,
+        sortOrder: bookmark.sortOrder,
+        favicon: bookmark.favicon,
+      }, 'api');
+      
+      results.push({
+        id: result.bookmark.id,
+        localId: bookmark.localId,
+      });
+    }
+    
+    res.status(201).json({ bookmarks: results, count: results.length });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid input', details: error.errors });
+    }
+    console.error('Batch create error:', error);
+    res.status(500).json({ error: 'Failed to create bookmarks' });
+  }
+});
+
 // Search bookmarks
 router.get('/search', (req: any, res) => {
   try {

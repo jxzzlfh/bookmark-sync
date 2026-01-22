@@ -6,7 +6,7 @@
 
 - **单向同步** - 浏览器书签 → 云端，浏览器为唯一数据源
 - **实时监听** - 本地书签增删改移动，自动同步到服务器
-- **定时同步** - 每 5 分钟自动全量同步 + 手动同步
+- **智能同步** - 定时增量同步（15分钟）+ 手动全量同步，大量书签时性能更优
 - **精美导航** - 导航网站按目录结构展示书签，支持亮色/暗色/自动主题
 - **全局搜索** - 快捷键 `Ctrl+0` 快速搜索所有书签
 - **自托管** - 数据完全自主掌控，支持 Docker 一键部署
@@ -69,9 +69,9 @@
       │                                                    │
       │  ─────────── 4. 按深度排序，父节点优先 ──────────►  │
       │                                                    │
-      │  ─────────── 5. 逐个上传书签/文件夹 ──────────►    │
-      │              POST /api/bookmarks                   │
-      │              (建立 localId ↔ remoteId 映射)         │
+      │  ─────────── 5. 批量上传书签/文件夹 ──────────►    │
+      │              POST /api/bookmarks/batch             │
+      │              (每批50条，建立 localId ↔ remoteId 映射) │
       │                                                    │
       │  ◄──────────── 6. 返回创建的书签信息 ─────────────  │
       │                                                    │
@@ -124,7 +124,7 @@ chrome.bookmarks.onRemoved.addListener(onBookmarkRemoved);
 chrome.bookmarks.onMoved.addListener(onBookmarkMoved);
 
 // 基于 Skill 指导的定时任务（避免 setInterval）
-chrome.alarms.create('periodic-sync', { periodInMinutes: 5 });
+chrome.alarms.create('periodic-sync', { periodInMinutes: 15 });
 ```
 
 ### 2. bookmark-sync-service Skill
@@ -296,7 +296,21 @@ docker-compose logs -f
 
 ## 📝 更新日志
 
-### v1.0.0
+### v1.0.1 (2026-01-22)
+
+**修复与优化**：
+- 🐛 修复 Service Worker 休眠后登录状态丢失的问题
+  - 每次唤醒时自动从 storage 恢复认证状态和 ID 映射
+- ⚡ 优化书签同步性能
+  - 新增批量上传 API (`/api/bookmarks/batch`)，每批 50 条
+  - 大量书签时同步速度显著提升
+- ⏰ 定时同步间隔调整为 15 分钟（原 5 分钟）
+- 🔄 智能同步策略
+  - 定时同步：增量同步（仅同步新增书签）
+  - 手动同步：全量同步（清空重建）
+- 💾 ID 映射持久化到 storage，避免重复上传
+
+### v1.0.0 (2026-01-21)
 
 - 单向同步：浏览器 → 服务器
 - 导航网站首页直接展示书签栏内容

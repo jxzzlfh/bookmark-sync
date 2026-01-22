@@ -1,21 +1,64 @@
 /**
  * Background Service Worker for Bookmark Sync Extension
  * Handles bookmark events and HTTPS REST API sync
+ * 
+ * IMPORTANT: Service Worker can be killed after ~30s idle.
+ * All state must be restored from storage on each wake.
  */
 
 import { StorageManager } from '../utils/storage';
 
 // Default config
 const DEFAULT_SERVER_URL = 'https://syn.xue.ee';
+const BATCH_SIZE = 50; // 批量上传大小
 
-// State
+// State (will be restored from storage on each wake)
 let isAuthenticated = false;
 let authToken: string | null = null;
 let isSyncing = false;
 
 // ID mapping: local Chrome ID <-> remote server ID
-const localToRemoteId = new Map<string, string>();
-const remoteToLocalId = new Map<string, string>();
+let localToRemoteId = new Map<string, string>();
+let remoteToLocalId = new Map<string, string>();
+
+// Track if state has been restored this session
+let stateRestored = false;
+
+/**
+ * Restore state from storage (called on every message/alarm)
+ */
+async function ensureStateRestored(): Promise<boolean> {
+  if (stateRestored && authToken) {
+    return isAuthenticated;
+  }
+  
+  try {
+    const settings = await StorageManager.getSettings();
+    
+    if (settings.authToken) {
+      authToken = settings.authToken;
+      isAuthenticated = true;
+      
+      // Restore ID mappings from storage
+      const idMap = await StorageManager.getIdMap();
+      localToRemoteId = new Map(Object.entries(idMap));
+      remoteToLocalId = new Map(
+        Object.entries(idMap).map(([local, remote]) => [remote, local])
+      );
+      
+      // Re-setup bookmark listeners
+      setupBookmarkListeners();
+      
+      console.log('[BookmarkSync] State restored, ID mappings:', localToRemoteId.size);
+    }
+    
+    stateRestored = true;
+    return isAuthenticated;
+  } catch (error) {
+    console.error('[BookmarkSync] Failed to restore state:', error);
+    return false;
+  }
+}
 
 // Initialize on install/update
 chrome.runtime.onInstalled.addListener(async (details) => {
@@ -26,22 +69,27 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     console.log('[BookmarkSync] Initial setup complete');
   }
   
-  // Set up periodic sync alarm (every 5 minutes)
-  chrome.alarms.create('periodic-sync', { periodInMinutes: 5 });
+  // Set up periodic sync alarm (every 15 minutes)
+  chrome.alarms.create('periodic-sync', { periodInMinutes: 15 });
 });
 
 // Handle startup
 chrome.runtime.onStartup.addListener(async () => {
   console.log('[BookmarkSync] Browser started');
-  await initializeSync();
+  await ensureStateRestored();
 });
 
 // Handle alarms
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'periodic-sync') {
     console.log('[BookmarkSync] Periodic sync triggered');
-    if (isAuthenticated && authToken) {
-      await performFullSync();
+    
+    // Restore state first
+    const authenticated = await ensureStateRestored();
+    
+    if (authenticated && authToken) {
+      // 定时同步使用增量同步
+      await performIncrementalSync();
     }
   }
 });
@@ -56,6 +104,9 @@ async function handleMessage(
   message: { type: string; data?: unknown },
   sendResponse: (response: unknown) => void
 ) {
+  // Always restore state first (handles service worker wake)
+  await ensureStateRestored();
+  
   switch (message.type) {
     case 'GET_STATUS':
       sendResponse({
@@ -92,6 +143,7 @@ async function handleMessage(
 
     case 'SYNC_NOW':
       try {
+        // 手动同步使用全量同步
         await performFullSync();
         sendResponse({ success: true });
       } catch (error) {
@@ -100,8 +152,9 @@ async function handleMessage(
       break;
 
     case 'SETTINGS_UPDATED':
-      // Reload settings
-      await initializeSync();
+      // Reload settings - reset state to force re-restore
+      stateRestored = false;
+      await ensureStateRestored();
       sendResponse({ success: true });
       break;
 
@@ -179,16 +232,6 @@ async function registerWithCredentials(email: string, password: string): Promise
   }
 }
 
-async function initializeSync() {
-  const settings = await StorageManager.getSettings();
-  
-  if (!settings.authToken) {
-    console.log('[BookmarkSync] No auth token, waiting for login');
-    return;
-  }
-
-  await handleLoginWithToken(settings.authToken);
-}
 
 async function handleLoginWithToken(token: string) {
   try {
@@ -196,6 +239,14 @@ async function handleLoginWithToken(token: string) {
     await StorageManager.saveSettings({ authToken: token });
     authToken = token;
     isAuthenticated = true;
+    stateRestored = true;
+    
+    // Restore ID mappings from storage
+    const idMap = await StorageManager.getIdMap();
+    localToRemoteId = new Map(Object.entries(idMap));
+    remoteToLocalId = new Map(
+      Object.entries(idMap).map(([local, remote]) => [remote, local])
+    );
     
     // Set up bookmark listeners
     setupBookmarkListeners();
@@ -210,12 +261,14 @@ async function handleLoginWithToken(token: string) {
 async function handleLogout() {
   isAuthenticated = false;
   authToken = null;
+  stateRestored = false;
   
   // Remove bookmark listeners
   removeBookmarkListeners();
   
-  // Clear stored credentials
+  // Clear stored credentials and ID mappings
   await StorageManager.saveSettings({ authToken: undefined });
+  await StorageManager.saveIdMap({});
   
   // Clear ID mappings
   localToRemoteId.clear();
@@ -226,6 +279,20 @@ async function handleLogout() {
 
 // ==================== Sync Functions ====================
 
+/**
+ * 持久化ID映射到storage
+ */
+async function persistIdMappings(): Promise<void> {
+  const idMap: Record<string, string> = {};
+  localToRemoteId.forEach((remote, local) => {
+    idMap[local] = remote;
+  });
+  await StorageManager.saveIdMap(idMap);
+}
+
+/**
+ * 全量同步 - 手动触发时使用
+ */
 async function performFullSync() {
   if (isSyncing) {
     console.log('[BookmarkSync] Sync already in progress');
@@ -263,19 +330,105 @@ async function performFullSync() {
     // Sort by depth (parents first)
     localBookmarks.sort((a, b) => a.depth - b.depth);
     
-    console.log('[BookmarkSync] Uploading', localBookmarks.length, 'bookmarks...');
+    console.log('[BookmarkSync] Uploading', localBookmarks.length, 'bookmarks in batches...');
     
-    // Step 3: Upload each bookmark
+    // Step 3: Upload bookmarks in batches (按深度分组，确保父节点先创建)
+    const depthGroups = new Map<number, FlatBookmark[]>();
     for (const bookmark of localBookmarks) {
-      await uploadBookmark(apiUrl, bookmark);
+      const group = depthGroups.get(bookmark.depth) || [];
+      group.push(bookmark);
+      depthGroups.set(bookmark.depth, group);
     }
     
-    // Step 4: Save last sync time
+    // 按深度顺序处理每组
+    const depths = Array.from(depthGroups.keys()).sort((a, b) => a - b);
+    for (const depth of depths) {
+      const bookmarksAtDepth = depthGroups.get(depth)!;
+      
+      // 批量上传当前深度的书签
+      for (let i = 0; i < bookmarksAtDepth.length; i += BATCH_SIZE) {
+        const batch = bookmarksAtDepth.slice(i, i + BATCH_SIZE);
+        await uploadBookmarkBatch(apiUrl, batch);
+      }
+    }
+    
+    // Step 4: Persist ID mappings and save last sync time
+    await persistIdMappings();
     await StorageManager.saveLastSyncTime(Date.now());
     
-    console.log('[BookmarkSync] Full sync complete!');
+    console.log('[BookmarkSync] Full sync complete! Total:', localBookmarks.length);
   } catch (error) {
     console.error('[BookmarkSync] Sync failed:', error);
+  } finally {
+    isSyncing = false;
+  }
+}
+
+/**
+ * 增量同步 - 定时触发时使用
+ * 仅同步本地书签事件监听器未能同步的变更
+ */
+async function performIncrementalSync() {
+  if (isSyncing) {
+    console.log('[BookmarkSync] Sync already in progress');
+    return;
+  }
+  
+  if (!authToken) {
+    console.log('[BookmarkSync] Not authenticated');
+    return;
+  }
+  
+  isSyncing = true;
+  console.log('[BookmarkSync] Starting incremental sync...');
+  
+  try {
+    const apiUrl = await getApiUrl();
+    
+    // 获取本地所有书签
+    const tree = await chrome.bookmarks.getTree();
+    const localBookmarks = flattenBookmarks(tree);
+    
+    // 找出未同步的书签（没有ID映射的）
+    const unsyncedBookmarks = localBookmarks.filter(b => !localToRemoteId.has(b.id));
+    
+    if (unsyncedBookmarks.length === 0) {
+      console.log('[BookmarkSync] No new bookmarks to sync');
+      await StorageManager.saveLastSyncTime(Date.now());
+      isSyncing = false;
+      return;
+    }
+    
+    // Sort by depth (parents first)
+    unsyncedBookmarks.sort((a, b) => a.depth - b.depth);
+    
+    console.log('[BookmarkSync] Incremental sync:', unsyncedBookmarks.length, 'new bookmarks');
+    
+    // 按深度分组上传
+    const depthGroups = new Map<number, FlatBookmark[]>();
+    for (const bookmark of unsyncedBookmarks) {
+      const group = depthGroups.get(bookmark.depth) || [];
+      group.push(bookmark);
+      depthGroups.set(bookmark.depth, group);
+    }
+    
+    const depths = Array.from(depthGroups.keys()).sort((a, b) => a - b);
+    for (const depth of depths) {
+      const bookmarksAtDepth = depthGroups.get(depth)!;
+      
+      for (let i = 0; i < bookmarksAtDepth.length; i += BATCH_SIZE) {
+        const batch = bookmarksAtDepth.slice(i, i + BATCH_SIZE);
+        await uploadBookmarkBatch(apiUrl, batch);
+      }
+    }
+    
+    // Persist and save time
+    await persistIdMappings();
+    await StorageManager.saveLastSyncTime(Date.now());
+    
+    console.log('[BookmarkSync] Incremental sync complete!');
+  } catch (error) {
+    console.error('[BookmarkSync] Incremental sync failed:', error);
   } finally {
     isSyncing = false;
   }
@@ -314,7 +467,70 @@ function flattenBookmarks(nodes: chrome.bookmarks.BookmarkTreeNode[], depth = 0)
   return result;
 }
 
-async function uploadBookmark(apiUrl: string, bookmark: FlatBookmark): Promise<void> {
+/**
+ * 批量上传书签
+ */
+async function uploadBookmarkBatch(apiUrl: string, bookmarks: FlatBookmark[]): Promise<void> {
+  const payloads = bookmarks.map(bookmark => {
+    let remoteParentId: string | null = null;
+    if (bookmark.parentId && bookmark.parentId !== '0') {
+      remoteParentId = localToRemoteId.get(bookmark.parentId) || null;
+    }
+    
+    return {
+      localId: bookmark.id,
+      parentId: remoteParentId,
+      title: bookmark.title,
+      url: bookmark.url || null,
+      isFolder: !bookmark.url,
+      sortOrder: bookmark.index,
+    };
+  });
+  
+  try {
+    const response = await fetch(`${apiUrl}/api/bookmarks/batch`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ bookmarks: payloads }),
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      // data.bookmarks 是返回的书签数组，包含 id 和 localId
+      if (data.bookmarks && Array.isArray(data.bookmarks)) {
+        for (const item of data.bookmarks) {
+          const remoteId = item.id;
+          const localId = item.localId;
+          if (remoteId && localId) {
+            localToRemoteId.set(localId, remoteId);
+            remoteToLocalId.set(remoteId, localId);
+          }
+        }
+        console.log('[BookmarkSync] Batch uploaded', data.bookmarks.length, 'bookmarks');
+      }
+    } else {
+      // 如果批量API不存在，回退到逐个上传
+      console.warn('[BookmarkSync] Batch API failed, falling back to individual uploads');
+      for (const bookmark of bookmarks) {
+        await uploadBookmarkSingle(apiUrl, bookmark);
+      }
+    }
+  } catch (error) {
+    console.error('[BookmarkSync] Batch upload error, falling back:', error);
+    // 回退到逐个上传
+    for (const bookmark of bookmarks) {
+      await uploadBookmarkSingle(apiUrl, bookmark);
+    }
+  }
+}
+
+/**
+ * 单个上传书签（作为批量上传的回退方案）
+ */
+async function uploadBookmarkSingle(apiUrl: string, bookmark: FlatBookmark): Promise<void> {
   // Determine remote parent ID
   let remoteParentId: string | null = null;
   if (bookmark.parentId && bookmark.parentId !== '0') {
@@ -347,10 +563,9 @@ async function uploadBookmark(apiUrl: string, bookmark: FlatBookmark): Promise<v
       if (remoteId) {
         localToRemoteId.set(bookmark.id, remoteId);
         remoteToLocalId.set(remoteId, bookmark.id);
-        console.log('[BookmarkSync] Mapped', bookmark.id, '->', remoteId, ':', bookmark.title);
       }
     } else {
-      console.warn('[BookmarkSync] Failed to upload bookmark:', bookmark.title, await response.text());
+      console.warn('[BookmarkSync] Failed to upload bookmark:', bookmark.title);
     }
   } catch (error) {
     console.error('[BookmarkSync] Upload error:', error);
@@ -374,6 +589,9 @@ function removeBookmarkListeners() {
 }
 
 async function onBookmarkCreated(id: string, bookmark: chrome.bookmarks.BookmarkTreeNode) {
+  // Ensure state is restored first
+  await ensureStateRestored();
+  
   if (!authToken || isSyncing) return;
   
   console.log('[BookmarkSync] Bookmark created:', id, bookmark.title);
@@ -407,6 +625,8 @@ async function onBookmarkCreated(id: string, bookmark: chrome.bookmarks.Bookmark
       if (remoteId) {
         localToRemoteId.set(id, remoteId);
         remoteToLocalId.set(remoteId, id);
+        // Persist mapping immediately
+        await persistIdMappings();
       }
     }
   } catch (error) {
@@ -415,6 +635,8 @@ async function onBookmarkCreated(id: string, bookmark: chrome.bookmarks.Bookmark
 }
 
 async function onBookmarkChanged(id: string, changeInfo: chrome.bookmarks.BookmarkChangeInfo) {
+  await ensureStateRestored();
+  
   if (!authToken || isSyncing) return;
   
   console.log('[BookmarkSync] Bookmark changed:', id, changeInfo);
@@ -442,6 +664,8 @@ async function onBookmarkChanged(id: string, changeInfo: chrome.bookmarks.Bookma
 }
 
 async function onBookmarkRemoved(id: string, _removeInfo: chrome.bookmarks.BookmarkRemoveInfo) {
+  await ensureStateRestored();
+  
   if (!authToken || isSyncing) return;
   
   console.log('[BookmarkSync] Bookmark removed:', id);
@@ -459,15 +683,18 @@ async function onBookmarkRemoved(id: string, _removeInfo: chrome.bookmarks.Bookm
       },
     });
     
-    // Clear mappings
+    // Clear mappings and persist
     localToRemoteId.delete(id);
     remoteToLocalId.delete(remoteId);
+    await persistIdMappings();
   } catch (error) {
     console.error('[BookmarkSync] Delete sync failed:', error);
   }
 }
 
 async function onBookmarkMoved(id: string, moveInfo: chrome.bookmarks.BookmarkMoveInfo) {
+  await ensureStateRestored();
+  
   if (!authToken || isSyncing) return;
   
   console.log('[BookmarkSync] Bookmark moved:', id, moveInfo);
@@ -499,4 +726,4 @@ async function onBookmarkMoved(id: string, moveInfo: chrome.bookmarks.BookmarkMo
 }
 
 // Initialize on load
-initializeSync();
+ensureStateRestored();
